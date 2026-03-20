@@ -32,9 +32,11 @@ export default function NoteDetail() {
   const [unlockPasswordInput, setUnlockPasswordInput] = useState('');
   const [isLockedByPass, setIsLockedByPass] = useState(false);
   const [lastSaved, setLastSaved] = useState(null);
+  const [selectionTick, setSelectionTick] = useState(0);
 
   const editorRef = useRef(null);
   const autosaveTimerRef = useRef(null);
+  const hydrationKeyRef = useRef(null);
 
   useEffect(() => {
     if (!isNew) {
@@ -57,11 +59,16 @@ export default function NoteDetail() {
         ...data,
         tags: Array.isArray(data.tags) ? data.tags : (data.tags ? data.tags.split(',') : [])
       });
-      setLastSaved(JSON.stringify(data));
+      const normalized = {
+        ...data,
+        tags: Array.isArray(data.tags) ? data.tags : (data.tags ? data.tags.split(',') : []),
+      };
+      setLastSaved(JSON.stringify(normalized));
       
       if (editorRef.current && (isNew || editorRef.current.innerHTML !== data.content)) {
         editorRef.current.innerHTML = data.content || '';
       }
+      localStorage.setItem(`lb_note_draft_${data.id}`, JSON.stringify(normalized));
       
       setLoading(false);
     } catch (err) {
@@ -69,6 +76,30 @@ export default function NoteDetail() {
       navigate('/');
     }
   };
+
+  useEffect(() => {
+    if (!editorRef.current) return;
+    if (!isNew && note.id && hydrationKeyRef.current !== note.id) return;
+    if (editorRef.current.innerHTML !== (note.content || '')) {
+      editorRef.current.innerHTML = note.content || '';
+    }
+  }, [note.content, note.id, isNew]);
+
+  useEffect(() => {
+    if (loading) return;
+    const storageKey = isNew ? 'lb_note_draft_new' : `lb_note_draft_${id}`;
+    const raw = localStorage.getItem(storageKey);
+    if (!raw) return;
+
+    try {
+      const draft = JSON.parse(raw);
+      setNote(prev => ({ ...prev, ...draft }));
+      hydrationKeyRef.current = draft.id || 'new';
+      if (editorRef.current) editorRef.current.innerHTML = draft.content || '';
+    } catch (error) {
+      console.error('Failed to restore note draft:', error);
+    }
+  }, [loading, isNew, id]);
 
   // Autosave effect
   useEffect(() => {
@@ -89,15 +120,13 @@ export default function NoteDetail() {
     if (autosaveTimerRef.current) clearTimeout(autosaveTimerRef.current);
 
     autosaveTimerRef.current = setTimeout(() => {
-      // If note becomes empty, and it was previously saved, we might want to delete it
-      // but let's stick to autosave for now.
       handleAutosave(currentNoteState);
-    }, 1000);
+    }, 700);
 
     return () => {
       if (autosaveTimerRef.current) clearTimeout(autosaveTimerRef.current);
     };
-  }, [note.title, note.mood, note.category, note.isPinned, note.isArchived, note.isLocked, note.tags, note._dirty, loading, isNew]);
+  }, [note, loading, isNew, lastSaved, saving]);
 
   const handleAutosave = async (noteToSave) => {
     // Auto-delete if empty
@@ -112,6 +141,9 @@ export default function NoteDetail() {
       }
       return;
     }
+
+    const draftKey = isNew ? 'lb_note_draft_new' : `lb_note_draft_${id}`;
+    localStorage.setItem(draftKey, JSON.stringify(noteToSave));
 
     setSaving(true);
     try {
@@ -135,7 +167,12 @@ export default function NoteDetail() {
       if (res.ok) {
         const data = await res.json();
         setLastSaved(JSON.stringify(noteToSave));
+        localStorage.setItem(`lb_note_draft_${data.id || id || 'new'}`, JSON.stringify({
+          ...noteToSave,
+          id: data.id || id
+        }));
         if (isNew) {
+          localStorage.removeItem('lb_note_draft_new');
           navigate(`/note/${data.id}`, { replace: true });
         }
       }
@@ -154,48 +191,11 @@ export default function NoteDetail() {
     }
   };
 
-  const handleSave = async () => {
-    setSaving(true);
-    const currentContent = editorRef.current ? editorRef.current.innerHTML : note.content;
-    
-    try {
-      const payload = {
-        ...note,
-        content: currentContent,
-        tags: note.tags,
-        isPinned: note.isPinned ? 1 : 0,
-        isArchived: note.isArchived ? 1 : 0,
-        isLocked: note.isLocked ? 1 : 0,
-      };
-
-      const url = isNew ? '/api/notes' : `/api/notes/${id}`;
-      const method = isNew ? 'POST' : 'PUT';
-
-      const res = await authFetch(url, {
-        method,
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-
-      if (!res.ok) throw new Error('Failed to save');
-      
-      const data = await res.json();
-      if (isNew) {
-        navigate(`/note/${data.id}`);
-      } else {
-        setSaving(false);
-        setLastSaved(JSON.stringify(payload));
-      }
-    } catch (err) {
-      alert(err.message);
-      setSaving(false);
-    }
-  };
-
   const handleDelete = async () => {
     if (!window.confirm('Are you sure you want to delete this memory? 🥺')) return;
     try {
       await authFetch(`/api/notes/${id}`, { method: 'DELETE' });
+      if (id) localStorage.removeItem(`lb_note_draft_${id}`);
       navigate('/');
     } catch (err) {
       alert(err.message);
@@ -236,7 +236,9 @@ export default function NoteDetail() {
   };
 
   const applyStyle = (command, value = null) => {
+    editorRef.current?.focus();
     document.execCommand(command, false, value);
+    setSelectionTick(v => v + 1);
     if (editorRef.current) editorRef.current.focus();
   };
 
@@ -249,9 +251,10 @@ export default function NoteDetail() {
   };
 
   const isCommandActive = (command) => {
+    void selectionTick;
     try {
       return document.queryCommandState(command);
-    } catch (e) {
+    } catch {
       return false;
     }
   };
@@ -420,16 +423,16 @@ export default function NoteDetail() {
           </div>
           
           <div className="toolbar-group">
-            <button className={`toolbar-item-new ${isCommandActive('bold') ? 'active' : ''}`} title="Bold" onClick={() => applyStyle('bold')}><b>B</b></button>
-            <button className={`toolbar-item-new ${isCommandActive('italic') ? 'active' : ''}`} title="Italic" onClick={() => applyStyle('italic')}><i>I</i></button>
-            <button className={`toolbar-item-new ${isCommandActive('underline') ? 'active' : ''}`} title="Underline" onClick={() => applyStyle('underline')}><u>U</u></button>
+            <button type="button" className={`toolbar-item-new ${isCommandActive('bold') ? 'active' : ''}`} title="Bold" onMouseDown={(e) => e.preventDefault()} onClick={() => applyStyle('bold')}><b>B</b></button>
+            <button type="button" className={`toolbar-item-new ${isCommandActive('italic') ? 'active' : ''}`} title="Italic" onMouseDown={(e) => e.preventDefault()} onClick={() => applyStyle('italic')}><i>I</i></button>
+            <button type="button" className={`toolbar-item-new ${isCommandActive('underline') ? 'active' : ''}`} title="Underline" onMouseDown={(e) => e.preventDefault()} onClick={() => applyStyle('underline')}><u>U</u></button>
           </div>
           
           <div className="toolbar-group">
-            <button className={`toolbar-item-new ${isCommandActive('insertUnorderedList') ? 'active' : ''}`} title="Bullet List" onClick={() => applyStyle('insertUnorderedList')}>
+            <button type="button" className={`toolbar-item-new ${isCommandActive('insertUnorderedList') ? 'active' : ''}`} title="Bullet List" onMouseDown={(e) => e.preventDefault()} onClick={() => applyStyle('insertUnorderedList')}>
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
             </button>
-            <button className={`toolbar-item-new ${isCommandActive('formatBlock') && document.queryCommandValue('formatBlock') === 'blockquote' ? 'active' : ''}`} title="Quote" onClick={() => applyStyle('formatBlock', 'blockquote')}>
+            <button type="button" className={`toolbar-item-new ${isCommandActive('formatBlock') && document.queryCommandValue('formatBlock') === 'blockquote' ? 'active' : ''}`} title="Quote" onMouseDown={(e) => e.preventDefault()} onClick={() => applyStyle('formatBlock', 'blockquote')}>
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 21c3 0 7-1 7-8V5H3v16zm11 0c3 0 7-1 7-8V5h-7v16z"/></svg>
             </button>
           </div>
@@ -440,12 +443,15 @@ export default function NoteDetail() {
           className={`editor-content-new ${handwriting ? 'handwriting' : ''}`}
           contentEditable
           placeholder="Write your secrets here..."
+          role="textbox"
+          aria-multiline="true"
+          spellCheck
           onDrop={(e) => { e.preventDefault(); }}
           onDragOver={(e) => { e.preventDefault(); }}
-          onInput={() => setNote(prev => ({ ...prev, _dirty: Date.now() }))}
+          onInput={(e) => setNote(prev => ({ ...prev, content: e.currentTarget.innerHTML }))}
           onBlur={(e) => setNote(prev => ({ ...prev, content: e.target.innerHTML }))}
-          onKeyUp={() => setNote(prev => ({ ...prev, _selectionChange: Date.now() }))}
-          onMouseUp={() => setNote(prev => ({ ...prev, _selectionChange: Date.now() }))}
+          onKeyUp={() => setSelectionTick(v => v + 1)}
+          onMouseUp={() => setSelectionTick(v => v + 1)}
           suppressContentEditableWarning={true}
         >
         </div>
